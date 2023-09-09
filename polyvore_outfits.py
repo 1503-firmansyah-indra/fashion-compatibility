@@ -24,7 +24,7 @@ def parse_iminfo(question, im2index, id2im, gt = None):
         gt: optional, the ground truth outfit set this item belongs to
     """
     questions = []
-    is_correct = np.zeros(len(question), np.bool)
+    is_correct = np.zeros(len(question), np.bool_)
     for index, im_id in enumerate(question):
         set_id = im_id.split('_')[0]
         if gt is None:
@@ -103,7 +103,8 @@ def load_fitb_questions(fn, im2index, id2im):
     return questions
 
 class TripletImageLoader(torch.utils.data.Dataset):
-    def __init__(self, args, split, meta_data, text_dim = None, transform=None, loader=default_image_loader):
+    def __init__(self, args, split, meta_data, text_dim = None, transform=None, 
+                 loader=default_image_loader, text_lazy_load=True):
         rootdir = os.path.join(args.datadir, 'polyvore_outfits', args.polyvore_split)
         self.impath = os.path.join(args.datadir, 'polyvore_outfits', 'images')
         self.is_train = split == 'train'
@@ -144,35 +145,54 @@ class TripletImageLoader(torch.utils.data.Dataset):
         self.transform = transform
         self.loader = loader
         self.split = split
+        
+        self.text_lazy_load = text_lazy_load
 
         if self.is_train:
             self.text_feat_dim = text_dim
-            self.desc2vecs = {}
-            featfile = os.path.join(rootdir, 'train_hglmm_pca6000.txt')
-            with open(featfile, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
+            if not self.text_lazy_load:
+                self.desc2vecs = {}
+                featfile = os.path.join(rootdir, 'train_hglmm_pca6000.txt')
+                with open(featfile, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        vec = line.split(',')
+                        label = ','.join(vec[:-self.text_feat_dim])
+                        vec = np.array([float(x) for x in vec[-self.text_feat_dim:]], np.float32)
+                        assert(len(vec) == text_dim)
+                        self.desc2vecs[label] = vec
                     
-                    vec = line.split(',')
-                    label = ','.join(vec[:-self.text_feat_dim])
-                    vec = np.array([float(x) for x in vec[-self.text_feat_dim:]], np.float32)
-                    assert(len(vec) == text_dim)
-                    self.desc2vecs[label] = vec
-                    
-            self.im2desc = {}
-            for im in imnames:
-                desc = meta_data[im]['title']
-                if not desc:
-                    desc = meta_data[im]['url_name']
-                    
-                desc = desc.replace('\n','').encode('ascii', 'ignore').strip().lower()
-                
-                # sometimes descriptions didn't map to any known words so they were
-                # removed, so only add those which have a valid feature representation
-                if desc and desc in self.desc2vecs:
+                self.im2desc = {}
+                for im in imnames:
+                    desc = meta_data[im]['title']
+                    if not desc:
+                        desc = meta_data[im]['url_name']
+
+                    desc = desc.replace('\n','').encode('ascii', 'ignore').strip().lower()
+
+                    # sometimes descriptions didn't map to any known words so they were
+                    # removed, so only add those which have a valid feature representation
+                    if desc and desc in self.desc2vecs:
+                        self.im2desc[im] = desc
+            else:
+                self.im2desc = {}
+                for im in imnames:
+                    desc = meta_data[im]['title']
+                    if not desc:
+                        desc = meta_data[im]['url_name']
+
+                    #desc = desc.replace('\n','').encode('ascii', 'ignore').strip().lower()
+                    desc = desc.replace('\n','').strip().lower()
                     self.im2desc[im] = desc
+                    
+                feat_map_file = os.path.join(rootdir, 'text_map.json')
+                with open(feat_map_file, 'r') as f:
+                    self.desc2file = json.load(f)
+                    
+                self.text_feat_dir = os.path.join(rootdir, 'textual_features')
 
             # At train time we pull the list of outfits and enumerate the pairwise
             # comparisons between them to train with.  Negatives are pulled by the
@@ -197,6 +217,13 @@ class TripletImageLoader(torch.utils.data.Dataset):
             self.fitb_questions = load_fitb_questions(fn, im2index, id2im)
             fn = os.path.join(rootdir, 'compatibility_%s.txt' % split)
             self.compatibility_questions = load_compatibility_questions(fn, im2index, id2im)
+            
+            
+    def load_text_feature(self, text_filename):
+        with open(os.path.join(self.text_feat_dir, text_filename), 'r') as f:
+            vec = np.array([float(x) for x in next(f).split(',')], np.float32)
+        return vec
+        
 
     def load_train_item(self, image_id):
         """ Returns a single item in the triplet and its data
@@ -206,7 +233,15 @@ class TripletImageLoader(torch.utils.data.Dataset):
         if self.transform is not None:
             img = self.transform(img)
 
-        if image_id in self.im2desc:
+        if image_id in self.im2desc and self.text_lazy_load:
+            text = self.im2desc[image_id]
+            if text in self.desc2file:
+                text_features = self.load_text_feature(self.desc2file[text])
+                has_text = 1
+            else:
+                text_features = np.zeros(self.text_feat_dim, np.float32)
+                has_text = 0.
+        elif image_id in self.im2desc and not self.text_lazy_load:
             text = self.im2desc[image_id]
             text_features = self.desc2vecs[text]
             has_text = 1
@@ -229,7 +264,7 @@ class TripletImageLoader(torch.utils.data.Dataset):
                        that was paired with the anchor
         """
         item_out = item_id
-        candidate_sets = self.category2ims[item_type].keys()
+        candidate_sets = list(self.category2ims[item_type].keys())
         attempts = 0
         while item_out == item_id and attempts < 100:
             choice = np.random.choice(candidate_sets)
